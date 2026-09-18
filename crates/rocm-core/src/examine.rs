@@ -1044,17 +1044,34 @@ fn classify_amd_marketing_name(name: &str) -> (String, bool) {
 /// This answers a question about the *part*, not about the host: a machine can
 /// pair an APU with a discrete card, so a true verdict here does not mean every
 /// GPU on the host is integrated.
+///
+/// `false` here folds together "this table knows the target is discrete" and
+/// "this table has never heard of the target". A caller that already holds a
+/// verdict from another source must not read that `false` as evidence — use
+/// [`gfx_apu_family_verdict`], which keeps the two apart.
 pub fn gfx_is_apu_family(gfx: &str) -> bool {
+    gfx_apu_family_verdict(gfx).unwrap_or(false)
+}
+
+/// Whether a gfx target belongs to an AMD APU family, or `None` when this table
+/// does not cover the target at all.
+///
+/// The table is deliberately narrow: it knows the gfx110x split and the gfx115x
+/// Strix parts, and nothing else. Every other target — including integrated ones
+/// older than the table, such as a Raphael iGPU (gfx1036) — answers `None`, which
+/// means "no opinion", NOT "discrete". Overwriting another probe's verdict with a
+/// `None` collapsed to `false` is how a known APU gets misfiled as discrete.
+fn gfx_apu_family_verdict(gfx: &str) -> Option<bool> {
     let g = gfx.to_lowercase();
     // gfx115x: every Strix part is an APU.
     if gfx_model_digit(&g, "gfx115").is_some() {
-        return true;
+        return Some(true);
     }
     // gfx110x: only gfx1103 and above are APUs; gfx1100/1101/1102 are discrete.
     if let Some(digit) = gfx_model_digit(&g, "gfx110") {
-        return digit >= 3;
+        return Some(digit >= 3);
     }
-    false
+    None
 }
 
 /// The model digit that follows `prefix` in a gfx target, e.g. `3` from
@@ -1198,9 +1215,15 @@ fn probe_gpus_rocminfo(e: &mut Examination) {
 }
 
 /// Map rocminfo's GPU agents onto the AMD GPUs `lspci` found, in order, and
-/// append any beyond that list as GPUs of their own. rocminfo is authoritative
-/// for `gfx_target`; `is_apu` is filled from the target's family only where no
-/// verdict exists yet, since the family table does not list every integrated part.
+/// append any beyond that list as GPUs of their own.
+///
+/// rocminfo is authoritative for `gfx_target`. For `is_apu` it outranks lspci's
+/// marketing-name keyword guess wherever the family table has a verdict, because
+/// a target is harder evidence than a product name — a rebranded APU missing from
+/// `APU_KEYWORDS` is guessed discrete by lspci and corrected here. Where the table
+/// has no verdict (see [`gfx_apu_family_verdict`]) lspci's guess is the only
+/// evidence there is, so it stands: that is what keeps a Raphael iGPU (gfx1036,
+/// outside the table) filed as integrated.
 fn apply_rocminfo_gpu_agents(e: &mut Examination, gfx_targets: Vec<(String, String)>) {
     if gfx_targets.is_empty() {
         return;
@@ -1220,8 +1243,8 @@ fn apply_rocminfo_gpu_agents(e: &mut Examination, gfx_targets: Vec<(String, Stri
             if !marketing.is_empty() && gpu.name.is_empty() {
                 gpu.name = marketing;
             }
-            if gpu.is_apu.is_none() {
-                gpu.is_apu = Some(gfx_is_apu_family(&gfx));
+            if let Some(family_verdict) = gfx_apu_family_verdict(&gfx) {
+                gpu.is_apu = Some(family_verdict);
             }
         } else {
             let is_apu = gfx_is_apu_family(&gfx);
@@ -2042,7 +2065,14 @@ fn probe_hip_sdk_windows(e: &mut Examination) {
                         .find(|g| g.is_amd && g.gfx_target.is_empty())
                 {
                     gpu.gfx_target = gfx;
-                    gpu.is_apu = Some(gfx_is_apu_family(&gpu.gfx_target));
+                    // Same rule as the Linux rocminfo path: the family table
+                    // outranks the display inventory's name guess where it has a
+                    // verdict, and leaves it alone where it has none. Collapsing
+                    // "not in the table" to `false` here would refile any
+                    // integrated part older than the table as discrete.
+                    if let Some(family_verdict) = gfx_apu_family_verdict(&gpu.gfx_target) {
+                        gpu.is_apu = Some(family_verdict);
+                    }
                 }
             }
         } else {
@@ -2886,8 +2916,10 @@ Agent 3
 
     #[test]
     fn rocminfo_targets_fill_lspci_gpus_without_changing_their_apu_verdict() {
-        // lspci already called Raphael an APU; the family table does not list gfx1036,
-        // so rocminfo must supply the target without overriding that verdict.
+        // lspci already called Raphael an APU; the family table has NO verdict for
+        // gfx1036, so rocminfo supplies the target and leaves that guess standing.
+        // The dGPU's gfx1100 is in the table, so its verdict is applied -- and
+        // agrees with lspci, which is why nothing moves here.
         let mut e = Examination {
             gpus: vec![
                 Gpu {
@@ -2933,6 +2965,91 @@ Agent 3
         assert_eq!(e.gpus[0].is_apu, Some(false));
         assert!(e.gpus[0].is_amd);
         assert_eq!(e.gpus[1].gfx_target, "gfx1036");
+    }
+
+    #[test]
+    fn rocminfo_target_overrides_an_lspci_guess_the_family_table_can_settle() {
+        // The correction branch has to actually fire: lspci always pushes a
+        // `Some(..)` keyword guess, so a rule that only filled `None` was dead code.
+        // A rebranded Strix part missing from `APU_KEYWORDS` is guessed DISCRETE
+        // from its marketing name; rocminfo names gfx1151, which the family table
+        // does settle, so the guess must be corrected rather than preserved.
+        let mut e = Examination {
+            gpus: vec![Gpu {
+                name: "AMD Radeon(TM) Graphics".to_owned(),
+                is_amd: true,
+                is_apu: Some(false),
+                ..Gpu::default()
+            }],
+            ..Examination::default()
+        };
+        apply_rocminfo_gpu_agents(
+            &mut e,
+            vec![("gfx1151".to_owned(), "AMD Radeon 8060S Graphics".to_owned())],
+        );
+        assert_eq!(e.gpus[0].gfx_target, "gfx1151");
+        assert_eq!(
+            e.gpus[0].is_apu,
+            Some(true),
+            "rocminfo's target outranks lspci's marketing-name guess where the family table has a verdict"
+        );
+    }
+
+    #[test]
+    fn rocminfo_agents_map_onto_lspci_gpus_positionally_and_must_not_swap() {
+        // The mapping is a positional zip: rocminfo's Nth GPU agent fills lspci's
+        // Nth AMD GPU. Nothing downstream re-checks that pairing, so pin it here --
+        // the e2e scenario cannot, since the human report names one target and no
+        // per-GPU identity to match records against. Distinct targets in each slot
+        // mean a reversed mapping fails rather than silently still containing both.
+        let mut e = Examination {
+            gpus: vec![
+                Gpu {
+                    name: "Navi 31 [Radeon RX 7900 XT]".to_owned(),
+                    pci_id: "0000:03:00.0".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(false),
+                    ..Gpu::default()
+                },
+                Gpu {
+                    name: "Raphael".to_owned(),
+                    pci_id: "0000:0f:00.0".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(true),
+                    ..Gpu::default()
+                },
+            ],
+            ..Examination::default()
+        };
+        apply_rocminfo_gpu_agents(&mut e, parse_rocminfo_gpu_agents(ROCMINFO_APU_PLUS_DGPU));
+        assert_eq!(
+            (e.gpus[0].pci_id.as_str(), e.gpus[0].gfx_target.as_str()),
+            ("0000:03:00.0", "gfx1100"),
+            "the first agent's target must land on the first AMD GPU lspci listed"
+        );
+        assert_eq!(
+            (e.gpus[1].pci_id.as_str(), e.gpus[1].gfx_target.as_str()),
+            ("0000:0f:00.0", "gfx1036"),
+            "the second agent's target must land on the second AMD GPU lspci listed"
+        );
+    }
+
+    #[test]
+    fn gfx_family_verdict_separates_no_opinion_from_discrete() {
+        // `gfx_is_apu_family` collapses both to `false`; the distinction is what
+        // lets a caller holding another probe's verdict know when to keep it.
+        assert_eq!(gfx_apu_family_verdict("gfx1151"), Some(true));
+        assert_eq!(gfx_apu_family_verdict("gfx1103"), Some(true));
+        assert_eq!(gfx_apu_family_verdict("gfx1100"), Some(false));
+        // Outside the table: integrated (Raphael) and discrete (MI300X, RDNA2)
+        // alike answer "no opinion", never "discrete".
+        assert_eq!(gfx_apu_family_verdict("gfx1036"), None);
+        assert_eq!(gfx_apu_family_verdict("gfx942"), None);
+        assert_eq!(gfx_apu_family_verdict("gfx1030"), None);
+        assert_eq!(gfx_apu_family_verdict(""), None);
+        // The public wrapper keeps its existing contract for callers that only
+        // want a yes/no about the part itself.
+        assert!(!gfx_is_apu_family("gfx1036"));
     }
 
     #[test]

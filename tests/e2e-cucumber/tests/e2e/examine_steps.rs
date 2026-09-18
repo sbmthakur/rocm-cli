@@ -506,21 +506,62 @@ async fn assert_json_names_target_per_gpu(world: &mut E2eWorld) {
     let expected = human_states(human, "detected_gfx_target")
         .filter(|t| t.starts_with("gfx"))
         .expect("the human report names no gfx target on a host that has a GPU");
-    let targets: Vec<String> = json
+    // Every AMD record, not just one: #393 emptied `gfx_target` on ALL of them,
+    // so asserting only that the expected target appears somewhere would still
+    // pass on a host where a second GPU's record came back blank.
+    let amd_targets: Vec<(String, String)> = json
         .get("gpus")
         .and_then(serde_json::Value::as_array)
         .map(|gpus| {
             gpus.iter()
-                .filter_map(|g| g.get("gfx_target").and_then(serde_json::Value::as_str))
-                .map(str::to_owned)
+                .filter(|g| g.get("is_amd").and_then(serde_json::Value::as_bool) == Some(true))
+                .map(|g| {
+                    let name = g
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let target = g
+                        .get("gfx_target")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    (name.to_owned(), target.to_owned())
+                })
                 .collect()
         })
         .unwrap_or_default();
     assert!(
-        targets.iter().any(|t| t == &expected),
-        "`examine --json` names no GPU with gfx_target {expected:?} \
-         (per-GPU targets: {targets:?}); the human report found it"
+        !amd_targets.is_empty(),
+        "`examine --json` lists no AMD GPU on a host whose human report names {expected:?}"
     );
+    let blank: Vec<&String> = amd_targets
+        .iter()
+        .filter(|(_, target)| target.is_empty())
+        .map(|(name, _)| name)
+        .collect();
+    assert!(
+        blank.is_empty(),
+        "`examine --json` leaves gfx_target empty for {blank:?} \
+         (all AMD records: {amd_targets:?}); rocminfo named a target for every agent"
+    );
+    let targets: Vec<&String> = amd_targets.iter().map(|(_, target)| target).collect();
+    assert!(
+        targets.iter().any(|t| *t == &expected),
+        "`examine --json` names no GPU with gfx_target {expected:?} \
+         (all AMD records: {amd_targets:?}); the human report found it"
+    );
+    // With one AMD GPU the mapping is pinned exactly: the sole record must be the
+    // one the human report describes, so a target landing on the wrong record has
+    // nowhere to hide. Multi-GPU ordering cannot be checked from here -- the human
+    // report names a single target and no per-GPU identity to match records
+    // against -- so `apply_rocminfo_gpu_agents`'s positional mapping is pinned by
+    // unit test instead.
+    if let [(name, target)] = amd_targets.as_slice() {
+        assert_eq!(
+            target, &expected,
+            "the host's only AMD GPU ({name:?}) carries gfx_target {target:?}, \
+             but the human report names {expected:?}"
+        );
+    }
 }
 
 #[then("both reports agree on whether this platform is in scope")]
